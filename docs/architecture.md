@@ -16,4 +16,4 @@ The long `evento-globolo-libs` repository is a historical bootstrap alias, not a
 
 Use `evento-globolo/evgl-libs` as the only Zed coordinate. A retained Git submodule must have an explicit editable-workspace, inventory, embedded-source, experiment-reference, or legacy role; do not resolve the same repository through both Zed and a gitlink in one composition.
 
-A root `.zpkg.toml` allows `zed overtake --git-submodules` to adopt an exact gitlink while preserving `.gitmodules` and the pinned commit.
+`zed overtake --git-submodules` imports each initialized submodule that declares its own `.zpkg.toml` into the root manifest and lockfile, retains `.gitmodules` as a reversible transport mirror, and records the exact gitlink commit.
