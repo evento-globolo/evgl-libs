@@ -17,3 +17,6 @@ exclude = [".env", ".env.*", "node_modules/**", "target/**", "dist/**", "*.log"]
 
 [scripts]
 test = "bash scripts/test.sh"
+
+[dependencies]
+"evento-globolo/evgl-interfaces" = "^0.1.0"
