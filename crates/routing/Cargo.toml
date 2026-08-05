@@ -1,0 +1,9 @@
+[package]
+name = "evgl-routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic routing helpers for Evento Globolo"
+
+[dependencies]
+evgl-contracts = { path = "../contracts" }

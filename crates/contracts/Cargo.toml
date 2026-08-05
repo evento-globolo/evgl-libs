@@ -1,0 +1,6 @@
+[package]
+name = "evgl-contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core contracts for Evento Globolo"
