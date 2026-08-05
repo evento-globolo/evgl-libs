@@ -10,13 +10,16 @@ language = "rust"
 vcs = "git"
 url = "https://github.com/evento-globolo/evgl-libs"
 
-[publish]
-include_readme = true
-tag_format = "v{version}"
-exclude = [".env", ".env.*", "node_modules/**", "target/**", "dist/**", "*.log"]
-
-[scripts]
-test = "bash scripts/test.sh"
+[install]
+dir = ".vendor/.zed"
 
 [dependencies]
 "evento-globolo/evgl-interfaces" = "^0.1.0"
+
+[publish]
+include_readme = true
+tag_format = "v{version}"
+exclude = [".env", ".env.*", "node_modules/**", "target/**", "dist/**", "*.log", ".vendor/.zed/**"]
+
+[scripts]
+test = "bash scripts/test.sh"
