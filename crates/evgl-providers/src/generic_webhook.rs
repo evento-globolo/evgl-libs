@@ -1,11 +1,8 @@
 use async_trait::async_trait;
 use evgl_domain::{
-    DeliveryMode, EventDraft, ProviderCapabilities, ProviderKind, Publication,
-    PublicationStatus,
+    DeliveryMode, EventDraft, ProviderCapabilities, ProviderKind, Publication, PublicationStatus,
 };
-use evgl_provider_sdk::{
-    OAuthStart, ProviderAdapter, ProviderError, PublishContext, TokenSet,
-};
+use evgl_provider_sdk::{OAuthStart, ProviderAdapter, ProviderError, PublishContext, TokenSet};
 use hmac::{Hmac, Mac};
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
@@ -30,7 +27,9 @@ impl Default for GenericWebhookAdapter {
 
 #[async_trait]
 impl ProviderAdapter for GenericWebhookAdapter {
-    fn kind(&self) -> ProviderKind { ProviderKind::GenericWebhook }
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::GenericWebhook
+    }
 
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
@@ -55,7 +54,9 @@ impl ProviderAdapter for GenericWebhookAdapter {
         _state: &str,
         _pkce_challenge: Option<&str>,
     ) -> Result<OAuthStart, ProviderError> {
-        Err(ProviderError::Unsupported("generic webhooks use a configured URL and secret"))
+        Err(ProviderError::Unsupported(
+            "generic webhooks use a configured URL and secret",
+        ))
     }
 
     async fn exchange_code(
@@ -63,7 +64,9 @@ impl ProviderAdapter for GenericWebhookAdapter {
         _code: &str,
         _pkce_verifier: Option<&str>,
     ) -> Result<TokenSet, ProviderError> {
-        Err(ProviderError::Unsupported("generic webhooks use a configured URL and secret"))
+        Err(ProviderError::Unsupported(
+            "generic webhooks use a configured URL and secret",
+        ))
     }
 
     async fn publish(
@@ -72,8 +75,13 @@ impl ProviderAdapter for GenericWebhookAdapter {
         event: &EventDraft,
         context: &PublishContext,
     ) -> Result<Publication, ProviderError> {
-        let endpoint = context.account_metadata.get("endpoint").and_then(Value::as_str)
-            .ok_or_else(|| ProviderError::Configuration("approved webhook endpoint is required".into()))?;
+        let endpoint = context
+            .account_metadata
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Configuration("approved webhook endpoint is required".into())
+            })?;
         let endpoint = Url::parse(endpoint)?;
         validate_endpoint(&endpoint)?;
         if tokens.access_token.expose_secret().len() < 32 {
@@ -90,7 +98,9 @@ impl ProviderAdapter for GenericWebhookAdapter {
             .map_err(|_| ProviderError::Configuration("invalid webhook secret".into()))?;
         mac.update(&payload);
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-        let response = self.http.post(endpoint)
+        let response = self
+            .http
+            .post(endpoint)
             .header("content-type", "application/json")
             .header("x-evgl-signature", signature)
             .body(payload)
@@ -117,7 +127,9 @@ impl ProviderAdapter for GenericWebhookAdapter {
             provider: self.kind(),
             status: PublicationStatus::Published,
             external_id: receipt.get("id").and_then(Value::as_str).map(str::to_owned),
-            external_url: receipt.get("url").and_then(Value::as_str)
+            external_url: receipt
+                .get("url")
+                .and_then(Value::as_str)
                 .and_then(|value| Url::parse(value).ok()),
             receipt,
             action: None,
@@ -139,7 +151,11 @@ fn validate_endpoint(endpoint: &Url) -> Result<(), ProviderError> {
             "webhook endpoint cannot target localhost".into(),
         ));
     }
-    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+    let address_host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(address) = address_host.parse::<std::net::IpAddr>() {
         let blocked = match address {
             std::net::IpAddr::V4(address) => {
                 address.is_private()
@@ -179,15 +195,18 @@ mod tests {
             "https://10.0.0.1/hook",
             "https://[::1]/hook",
         ] {
-            assert!(validate_endpoint(&Url::parse(value).unwrap()).is_err(), "{value}");
+            assert!(
+                validate_endpoint(&Url::parse(value).unwrap()).is_err(),
+                "{value}"
+            );
         }
     }
 
     #[test]
     fn accepts_public_https_targets() {
-        assert!(validate_endpoint(
-            &Url::parse("https://events.example.com/hooks/evgl").unwrap(),
-        )
-        .is_ok());
+        assert!(
+            validate_endpoint(&Url::parse("https://events.example.com/hooks/evgl").unwrap(),)
+                .is_ok()
+        );
     }
 }

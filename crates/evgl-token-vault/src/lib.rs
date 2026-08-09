@@ -33,7 +33,7 @@ impl StoredTokenSet {
                 .refresh_token
                 .as_ref()
                 .map(|token| token.expose_secret().to_owned()),
-            expires_at: tokens.expires_at.clone(),
+            expires_at: tokens.expires_at,
             scopes: tokens.scopes.clone(),
             provider_data: tokens.provider_data.clone(),
         }
@@ -62,13 +62,15 @@ impl Drop for StoredTokenSet {
 impl TokenVault {
     pub fn from_base64_key(encoded: &str) -> Result<Self, VaultError> {
         let decoded = Zeroizing::new(
-            STANDARD.decode(encoded).map_err(|_| VaultError::InvalidKey)?,
+            STANDARD
+                .decode(encoded)
+                .map_err(|_| VaultError::InvalidKey)?,
         );
         if decoded.len() != 32 {
             return Err(VaultError::InvalidKey);
         }
-        let cipher = Aes256Gcm::new_from_slice(decoded.as_slice())
-            .map_err(|_| VaultError::InvalidKey)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(decoded.as_slice()).map_err(|_| VaultError::InvalidKey)?;
         Ok(Self { cipher })
     }
 
@@ -150,16 +152,10 @@ mod tests {
             scopes: vec!["events".into()],
             provider_data: Value::Null,
         };
-        let encrypted = vault
-            .encrypt(b"user:eventbrite:org-1", &tokens)
-            .unwrap();
-        let decrypted = vault
-            .decrypt(b"user:eventbrite:org-1", &encrypted)
-            .unwrap();
+        let encrypted = vault.encrypt(b"user:eventbrite:org-1", &tokens).unwrap();
+        let decrypted = vault.decrypt(b"user:eventbrite:org-1", &encrypted).unwrap();
         assert_eq!(decrypted.access_token.expose_secret(), "top-secret");
-        assert!(vault
-            .decrypt(b"user:eventbrite:org-2", &encrypted)
-            .is_err());
+        assert!(vault.decrypt(b"user:eventbrite:org-2", &encrypted).is_err());
         assert!(!encrypted.contains("top-secret"));
     }
 
