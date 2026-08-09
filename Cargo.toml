@@ -1,8 +1,35 @@
 [workspace]
 resolver = "2"
-members = ["crates/contracts", "crates/routing"]
+members = [
+  "crates/contracts",
+  "crates/routing",
+  "crates/evgl-domain",
+  "crates/evgl-provider-sdk",
+  "crates/evgl-providers",
+  "crates/evgl-token-vault",
+]
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
 version = "0.1.0"
+repository = "https://github.com/evento-globolo/evgl-libs"
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+hmac = "0.12"
+http = "1"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tracing = "0.1"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"
