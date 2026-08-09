@@ -38,7 +38,7 @@ jobs:
           toolchain: stable
           components: rustfmt,clippy
 
-      - name: Apply the two compiler-directed fixes and run the full repository test script
+      - name: Apply the three compiler-directed fixes and run the full repository test script
         shell: bash
         run: |
           set -euo pipefail
@@ -49,10 +49,15 @@ jobs:
           perl -0pi -e 's/expires_at: tokens\.expires_at\.clone\(\),/expires_at: tokens.expires_at,/' \
             crates/evgl-token-vault/src/lib.rs
 
+          perl -0pi -e 's/expires_at: tokens\.expires_at\.clone\(\),/expires_at: tokens.expires_at,/' \
+            crates/evgl-providers/src/meta.rs
+
           ! grep -Fq 'errors.to_string()' crates/evgl-providers/src/meetup.rs
           ! grep -Fq 'tokens.expires_at.clone()' crates/evgl-token-vault/src/lib.rs
+          ! grep -Fq 'tokens.expires_at.clone()' crates/evgl-providers/src/meta.rs
           grep -Fq 'serde_json::to_string(errors)' crates/evgl-providers/src/meetup.rs
           grep -Fq 'expires_at: tokens.expires_at,' crates/evgl-token-vault/src/lib.rs
+          grep -Fq 'expires_at: tokens.expires_at,' crates/evgl-providers/src/meta.rs
 
           cargo fmt --all
           ./scripts/test.sh
@@ -62,10 +67,11 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add \
             crates/evgl-providers/src/meetup.rs \
+            crates/evgl-providers/src/meta.rs \
             crates/evgl-token-vault/src/lib.rs
           if [[ -f Cargo.lock ]]; then
             git add -f Cargo.lock
           fi
           git commit -m 'fix: serialize provider errors and satisfy Clippy' \
-            -m 'Applies only the two exact-head compiler findings from the recovered provider workspace and records the resolved lockfile.'
+            -m 'Applies only the three exact-head compiler findings from the recovered provider workspace and records the resolved lockfile.'
           git push origin HEAD:agent/provider-cross-posting
