@@ -31,7 +31,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .recovery/provider-cross-posting/part-* | base64 --decode | tar -xzf -
+
+          expected='f9f111bbf56730fb54cc9ac544f191e65a12f5aa98f859d8a2dec786d2823df3'
+          actual="$(sha256sum .recovery/provider-cross-posting/payload.tar.gz | awk '{print $1}')"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "payload checksum mismatch: expected $expected, got $actual" >&2
+            exit 1
+          fi
+
+          tar -xzf .recovery/provider-cross-posting/payload.tar.gz
           git diff --check
 
           if grep -RIE --exclude-dir=.git --exclude-dir=.recovery --exclude='recover-provider-cross-posting.yml' \
