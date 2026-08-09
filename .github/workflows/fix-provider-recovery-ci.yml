@@ -38,7 +38,7 @@ jobs:
           toolchain: stable
           components: rustfmt,clippy
 
-      - name: Apply the three compiler-directed fixes and run the full repository test script
+      - name: Apply exact compiler and SSRF-test fixes, then run the full repository test script
         shell: bash
         run: |
           set -euo pipefail
@@ -52,12 +52,17 @@ jobs:
           perl -0pi -e 's/expires_at: tokens\.expires_at\.clone\(\),/expires_at: tokens.expires_at,/' \
             crates/evgl-providers/src/meta.rs
 
+          perl -0pi -e 's/    if let Ok\(address\) = host\.parse::<std::net::IpAddr>\(\) \{/    let address_host = host\n        .strip_prefix('"'"'['"'"')\n        .and_then(|value| value.strip_suffix('"'"']'"'"'))\n        .unwrap_or(host);\n    if let Ok(address) = address_host.parse::<std::net::IpAddr>() {/' \
+            crates/evgl-providers/src/generic_webhook.rs
+
           ! grep -Fq 'errors.to_string()' crates/evgl-providers/src/meetup.rs
           ! grep -Fq 'tokens.expires_at.clone()' crates/evgl-token-vault/src/lib.rs
           ! grep -Fq 'tokens.expires_at.clone()' crates/evgl-providers/src/meta.rs
           grep -Fq 'serde_json::to_string(errors)' crates/evgl-providers/src/meetup.rs
           grep -Fq 'expires_at: tokens.expires_at,' crates/evgl-token-vault/src/lib.rs
           grep -Fq 'expires_at: tokens.expires_at,' crates/evgl-providers/src/meta.rs
+          grep -Fq '.strip_prefix('"'"'['"'"')' crates/evgl-providers/src/generic_webhook.rs
+          grep -Fq 'address_host.parse::<std::net::IpAddr>()' crates/evgl-providers/src/generic_webhook.rs
 
           cargo fmt --all
           ./scripts/test.sh
@@ -66,12 +71,13 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add \
+            crates/evgl-providers/src/generic_webhook.rs \
             crates/evgl-providers/src/meetup.rs \
             crates/evgl-providers/src/meta.rs \
             crates/evgl-token-vault/src/lib.rs
           if [[ -f Cargo.lock ]]; then
             git add -f Cargo.lock
           fi
-          git commit -m 'fix: serialize provider errors and satisfy Clippy' \
-            -m 'Applies only the three exact-head compiler findings from the recovered provider workspace and records the resolved lockfile.'
+          git commit -m 'fix: harden recovered provider adapters' \
+            -m 'Applies the three compiler-directed fixes and normalizes bracketed IPv6 hosts before the private-address SSRF guard. Full repository tests must pass before publication.'
           git push origin HEAD:agent/provider-cross-posting
