@@ -12,3 +12,6 @@ tmp
 temp
 tmp/worktrees
 temp/worktrees
+target/
+__pycache__/
+*.py[cod]
