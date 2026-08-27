@@ -26,10 +26,12 @@ export function makeEvent(type, payload = {}, meta = {}) {
   return { id: meta.id || crypto.randomUUID(), type, payload, product: serviceCatalog.org, occurredAt: meta.occurredAt || new Date().toISOString() };
 }
 
+const PRIORITY_BY_SEVERITY = new Map([
+  ['critical', 'urgent'], ['p0', 'urgent'], ['sev0', 'urgent'], ['sev1', 'urgent'],
+  ['high', 'high'], ['p1', 'high'], ['sev2', 'high'],
+  ['medium', 'normal'], ['p2', 'normal'], ['warn', 'normal'], ['warning', 'normal'],
+]);
+
 export function classifyPriority(signal) {
-  const severity = String(signal?.severity || '').toLowerCase();
-  if (['critical', 'p0', 'sev0', 'sev1'].includes(severity)) return 'urgent';
-  if (['high', 'p1', 'sev2'].includes(severity)) return 'high';
-  if (['medium', 'p2', 'warn', 'warning'].includes(severity)) return 'normal';
-  return 'low';
+  return PRIORITY_BY_SEVERITY.get(String(signal?.severity || '').toLowerCase()) ?? 'low';
 }
