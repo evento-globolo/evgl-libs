@@ -24,14 +24,10 @@ impl EventEnvelope {
 }
 
 pub fn valid_kind(value: &str) -> bool {
-    let mut saw_dot = false;
-    if value.is_empty() { return false; }
-    for (index, ch) in value.chars().enumerate() {
-        if ch == '.' { saw_dot = true; continue; }
-        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-') { return false; }
-        if index == 0 && !ch.is_ascii_lowercase() { return false; }
-    }
-    saw_dot
+    fn allowed(ch: char) -> bool { ch == '.' || ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-' }
+    matches!(value.chars().next(), Some(first) if first == '.' || first.is_ascii_lowercase())
+        && value.chars().all(allowed)
+        && value.contains('.')
 }
 
 pub const PRODUCT: &str = "evento-globolo";
@@ -44,5 +40,6 @@ mod tests {
         assert!(valid_kind("case.created"));
         assert!(!valid_kind("CaseCreated"));
         assert!(!valid_kind("created"));
+        assert!(!valid_kind("1case.created"));
     }
 }
