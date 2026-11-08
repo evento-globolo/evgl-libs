@@ -57,6 +57,12 @@ impl TlsFixture {
                 "/CN=fixture.invalid",
                 "-addext",
                 "subjectAltName=DNS:fixture.invalid",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-addext",
+                "keyUsage=critical,digitalSignature,keyEncipherment",
+                "-addext",
+                "extendedKeyUsage=serverAuth",
                 "-keyout",
             ])
             .arg(&key)
