@@ -7,23 +7,13 @@ use hmac::{Hmac, Mac};
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 use sha2::Sha256;
+use std::{net::{IpAddr, SocketAddr}, time::Duration};
 use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub struct GenericWebhookAdapter {
-    http: reqwest::Client,
-}
-
-impl Default for GenericWebhookAdapter {
-    fn default() -> Self {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("static reqwest client configuration is valid");
-        Self { http }
-    }
-}
+#[derive(Default)]
+pub struct GenericWebhookAdapter;
 
 #[async_trait]
 impl ProviderAdapter for GenericWebhookAdapter {
@@ -98,8 +88,10 @@ impl ProviderAdapter for GenericWebhookAdapter {
             .map_err(|_| ProviderError::Configuration("invalid webhook secret".into()))?;
         mac.update(&payload);
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-        let response = self
-            .http
+        // Resolve, validate, and pin the destination at each delivery.
+        // Never reuse a connection pool after the DNS decision.
+        let http = guarded_client_for_endpoint(&endpoint).await?;
+        let response = http
             .post(endpoint)
             .header("content-type", "application/json")
             .header("x-evgl-signature", signature)
@@ -143,42 +135,136 @@ fn validate_endpoint(endpoint: &Url) -> Result<(), ProviderError> {
             "webhook endpoint must use HTTPS".into(),
         ));
     }
-    let host = endpoint.host_str().ok_or_else(|| {
-        ProviderError::Configuration("webhook endpoint must include a host".into())
-    })?;
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+    if !endpoint.username().is_empty() || endpoint.password().is_some() {
         return Err(ProviderError::Configuration(
-            "webhook endpoint cannot target localhost".into(),
+            "webhook endpoint cannot contain userinfo credentials".into(),
         ));
     }
-    let address_host = host
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(address) = address_host.parse::<std::net::IpAddr>() {
-        let blocked = match address {
-            std::net::IpAddr::V4(address) => {
-                address.is_private()
-                    || address.is_loopback()
-                    || address.is_link_local()
-                    || address.is_broadcast()
-                    || address.is_documentation()
-                    || address.is_unspecified()
+    let host = endpoint.host().ok_or_else(|| {
+        ProviderError::Configuration("webhook endpoint must include a host".into())
+    })?;
+    match host {
+        url::Host::Domain(domain) => {
+            let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+            if normalized.is_empty()
+                || normalized == "localhost"
+                || normalized.ends_with(".localhost")
+                || normalized == "local"
+                || normalized.ends_with(".local")
+                || normalized == "internal"
+                || normalized.ends_with(".internal")
+            {
+                return Err(ProviderError::Configuration(
+                    "webhook endpoint cannot target a local hostname".into(),
+                ));
             }
-            std::net::IpAddr::V6(address) => {
-                address.is_loopback()
-                    || address.is_unspecified()
-                    || address.is_unique_local()
-                    || address.is_unicast_link_local()
+        }
+        url::Host::Ipv4(ip) => {
+            if !public_address(IpAddr::V4(ip)) {
+                return Err(ProviderError::Configuration(
+                    "webhook endpoint cannot target a non-public address".into(),
+                ));
             }
-        };
-        if blocked {
-            return Err(ProviderError::Configuration(
-                "webhook endpoint cannot target a private or local address".into(),
-            ));
+        }
+        url::Host::Ipv6(ip) => {
+            if !public_address(IpAddr::V6(ip)) {
+                return Err(ProviderError::Configuration(
+                    "webhook endpoint cannot target a non-public address".into(),
+                ));
+            }
         }
     }
     Ok(())
+}
+
+fn public_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(
+                v4.is_private()
+                    || v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_documentation()
+                    || v4.is_unspecified()
+                    || v4.is_multicast()
+                    || o[0] == 0
+                    || o[0] >= 240
+                    || (o[0] == 100 && (64..=127).contains(&o[1]))
+                    || (o[0] == 198 && (18..=19).contains(&o[1]))
+                    || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+            )
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return public_address(IpAddr::V4(mapped));
+            }
+            // Permit global-unicast candidates only. Exclude documentation,
+            // Teredo and 6to4 tunnels, which can encapsulate private IPv4.
+            let s = v6.segments();
+            (s[0] & 0xe000) == 0x2000
+                && !(s[0] == 0x2001 && (s[1] == 0 || s[1] == 0x0db8))
+                && s[0] != 0x2002
+        }
+    }
+}
+
+fn validate_addresses(addrs: &[SocketAddr]) -> Result<(), ProviderError> {
+    if addrs.is_empty() || addrs.len() > 32 || addrs.iter().any(|a| !public_address(a.ip())) {
+        return Err(ProviderError::Configuration(
+            "webhook DNS must resolve exclusively to public addresses".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn guarded_client_for_endpoint(endpoint: &Url) -> Result<reqwest::Client, ProviderError> {
+    validate_endpoint(endpoint)?;
+    let port = endpoint.port_or_known_default().ok_or_else(|| {
+        ProviderError::Configuration("webhook endpoint needs a valid TLS port".into())
+    })?;
+
+    // The hostname stays in the URL for TLS certificate verification/SNI,
+    // but the actual socket destinations are pinned to this vetted answer.
+    // A new client on every delivery avoids stale, unvalidated pooled sockets.
+    let hostname = match endpoint.host().ok_or_else(|| {
+        ProviderError::Configuration("webhook host is required".into())
+    })? {
+        url::Host::Domain(name) => Some(name.to_owned()),
+        url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
+    };
+    let addrs: Vec<SocketAddr> = if let Some(name) = hostname.as_deref() {
+        tokio::net::lookup_host((name, port))
+            .await
+            .map_err(|error| ProviderError::Configuration(format!(
+                "webhook hostname DNS lookup failed: {error}"
+            )))?
+            .collect()
+    } else {
+        match endpoint.host() {
+            Some(url::Host::Ipv4(ip)) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
+            Some(url::Host::Ipv6(ip)) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
+            _ => return Err(ProviderError::Configuration(
+                "webhook IP endpoint is invalid".into(),
+            )),
+        }
+    };
+    validate_addresses(&addrs)?;
+
+    // Proxies would bypass the connection pin and allow proxy-mediated SSRF.
+    let builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15));
+    let builder = if let Some(name) = hostname.as_deref() {
+        builder.resolve_to_addrs(name, &addrs)
+    } else {
+        builder
+    };
+    Ok(builder.build()?)
 }
 
 #[cfg(test)]
