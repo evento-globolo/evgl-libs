@@ -22,6 +22,7 @@ struct TlsFixture {
     directory: PathBuf,
     certificate: reqwest::Certificate,
     server: Child,
+    response_worker: Option<thread::JoinHandle<()>>,
 }
 
 impl TlsFixture {
@@ -127,19 +128,28 @@ impl TlsFixture {
             }
             assert!(ready, "local TLS fixture did not bind within two seconds");
         }
-        if let Some(wire) = response {
-            server
+        let response_worker = response.map(|wire| {
+            let mut stdin = server
                 .stdin
-                .as_mut()
-                .expect("custom-response server accepts fixture input")
-                .write_all(wire)
-                .expect("write synthetic HTTP redirect");
-        }
+                .take()
+                .expect("custom-response server accepts fixture input");
+            thread::spawn(move || {
+                // OpenSSL s_server reads stdin even before completing a TLS
+                // handshake. Send the fixture only once the client has had
+                // time to connect and submit the HTTPS request.
+                thread::sleep(Duration::from_millis(800));
+                stdin
+                    .write_all(wire)
+                    .expect("send synthetic response after TLS handshake");
+                stdin.flush().expect("flush synthetic HTTPS response");
+            })
+        });
         Self {
             address,
             directory,
             certificate,
             server,
+            response_worker,
         }
     }
 
@@ -160,6 +170,9 @@ impl Drop for TlsFixture {
     fn drop(&mut self) {
         let _ = self.server.kill();
         let _ = self.server.wait();
+        if let Some(worker) = self.response_worker.take() {
+            let _ = worker.join();
+        }
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
