@@ -320,12 +320,7 @@ fn client_for_resolved(
     validate_addresses(addrs)?;
 
     // Proxies would bypass the connection pin and allow proxy-mediated SSRF.
-    let builder = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .https_only(true)
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15));
+    let builder = webhook_client_builder();
     let builder = if let Some(name) = hostname {
         builder.resolve_to_addrs(name, addrs)
     } else {
@@ -627,3 +622,17 @@ mod tests {
     }
 
 }
+// All production and transport-fixture clients share these exact policy
+// defaults. The fixture only overrides DNS and test-root trust; it never
+// changes the redirect, proxy, HTTPS-only or timeout policy.
+fn webhook_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod transport_integration_tests;
