@@ -141,11 +141,11 @@ fn validate_payload_size(size: usize) -> Result<(), ProviderError> {
             "webhook request payload exceeds the configured size limit".into(),
         ));
     }
-    return Ok(());
+    Ok(())
 }
 
 fn remote_status_error(status: reqwest::StatusCode) -> ProviderError {
-    return ProviderError::Remote {
+    ProviderError::Remote {
         status: status.as_u16(),
         body: "remote response body withheld".into(),
     };
@@ -158,7 +158,7 @@ fn append_bounded(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ProviderErro
         ));
     }
     buffer.extend_from_slice(chunk);
-    return Ok(());
+    Ok(())
 }
 
 async fn read_response_limited(response: &mut reqwest::Response) -> Result<String, ProviderError> {
@@ -173,7 +173,7 @@ async fn read_response_limited(response: &mut reqwest::Response) -> Result<Strin
     while let Some(chunk) = response.chunk().await? {
         append_bounded(&mut body, &chunk)?;
     }
-    return String::from_utf8(body).map_err(|_| {
+    String::from_utf8(body).map_err(|_| {
         ProviderError::InvalidResponse("webhook response must be UTF-8".into())
     });
 }
@@ -185,7 +185,7 @@ async fn lookup_before_deadline<F, T>(
 where
     F: Future<Output = std::io::Result<T>>,
 {
-    return tokio::time::timeout(duration, lookup)
+    tokio::time::timeout(duration, lookup)
         .await
         .map_err(|_| ProviderError::Configuration("webhook DNS lookup timed out".into()))?
         .map_err(|_| ProviderError::Configuration("webhook DNS lookup failed".into()));
