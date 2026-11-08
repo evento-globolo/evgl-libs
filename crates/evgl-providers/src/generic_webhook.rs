@@ -266,8 +266,8 @@ fn client_for_resolved(
         .https_only(true)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15));
-    let builder = if let Some(name) = hostname.as_deref() {
-        builder.resolve_to_addrs(name, &addrs)
+    let builder = if let Some(name) = hostname {
+        builder.resolve_to_addrs(name, addrs)
     } else {
         builder
     };
