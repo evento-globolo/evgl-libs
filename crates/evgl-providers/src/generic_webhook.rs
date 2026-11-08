@@ -148,7 +148,7 @@ fn remote_status_error(status: reqwest::StatusCode) -> ProviderError {
     ProviderError::Remote {
         status: status.as_u16(),
         body: "remote response body withheld".into(),
-    };
+    }
 }
 
 fn append_bounded(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ProviderError> {
@@ -175,7 +175,7 @@ async fn read_response_limited(response: &mut reqwest::Response) -> Result<Strin
     }
     String::from_utf8(body).map_err(|_| {
         ProviderError::InvalidResponse("webhook response must be UTF-8".into())
-    });
+    })
 }
 
 async fn lookup_before_deadline<F, T>(
@@ -188,7 +188,7 @@ where
     tokio::time::timeout(duration, lookup)
         .await
         .map_err(|_| ProviderError::Configuration("webhook DNS lookup timed out".into()))?
-        .map_err(|_| ProviderError::Configuration("webhook DNS lookup failed".into()));
+        .map_err(|_| ProviderError::Configuration("webhook DNS lookup failed".into()))
 }
 
 fn validate_endpoint(endpoint: &Url) -> Result<(), ProviderError> {
