@@ -103,6 +103,30 @@ impl TlsFixture {
             command.arg("-www").stdin(Stdio::null());
         }
         let mut server = command.spawn().expect("launch local OpenSSL TLS responder");
+        if response.is_some() {
+            // This is a one-shot custom response on the OpenSSL stdin pipe.
+            // A TCP readiness probe can consume that response before the
+            // actual HTTP client connects. Wait for server startup instead.
+            thread::sleep(Duration::from_millis(350));
+            assert!(
+                server.try_wait().expect("check custom TLS fixture").is_none(),
+                "custom TLS fixture exited before accepting a connection"
+            );
+        } else {
+            let mut ready = false;
+            for _ in 0..100 {
+                if TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok() {
+                    ready = true;
+                    break;
+                }
+                assert!(
+                    server.try_wait().expect("check TLS fixture process").is_none(),
+                    "TLS fixture exited early"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(ready, "local TLS fixture did not bind within two seconds");
+        }
         if let Some(wire) = response {
             server
                 .stdin
@@ -111,16 +135,6 @@ impl TlsFixture {
                 .write_all(wire)
                 .expect("write synthetic HTTP redirect");
         }
-        let mut ready = false;
-        for _ in 0..100 {
-            if TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok() {
-                ready = true;
-                break;
-            }
-            assert!(server.try_wait().expect("check TLS fixture process").is_none(), "TLS fixture exited early");
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(ready, "local TLS fixture did not bind within two seconds");
         Self {
             address,
             directory,
