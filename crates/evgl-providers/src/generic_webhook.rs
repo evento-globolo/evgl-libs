@@ -338,10 +338,11 @@ fn client_for_resolved(
 mod tests {
     use super::{
         append_bounded, client_for_resolved, guarded_client_for_endpoint, lookup_before_deadline,
-        public_address, remote_status_error, validate_addresses, validate_endpoint,
-        validate_payload_size, MAX_WEBHOOK_REQUEST_BYTES, MAX_WEBHOOK_RESPONSE_BYTES,
+        public_address, read_response_limited, remote_status_error, validate_addresses,
+        validate_endpoint, validate_payload_size, MAX_WEBHOOK_REQUEST_BYTES,
+        MAX_WEBHOOK_RESPONSE_BYTES,
     };
-    use std::{future::pending, net::{IpAddr, SocketAddr}, time::Duration};
+    use std::{future::pending, io::{Read, Write}, net::{IpAddr, SocketAddr, TcpListener}, thread, time::Duration};
     use url::Url;
 
     #[test]
@@ -533,6 +534,96 @@ mod tests {
             ).await;
             assert!(direct.is_err());
         });
+    }
+
+    // A real loopback HTTP socket exercises reqwest response framing and the
+    // production receipt reader, without granting the production egress guard
+    // permission to contact loopback.
+    fn serve_one_local_response(wire: Vec<u8>) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = [0_u8; 512];
+            let _ = socket.read(&mut request);
+            // A client that fails closed may drop the connection while sending.
+            // This is expected and must not make the test flaky.
+            let _ = socket.write_all(&wire);
+        });
+        (addr, server)
+    }
+
+    #[test]
+    fn live_loopback_chunked_body_overflow_is_rejected() {
+        let mut wire = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+            MAX_WEBHOOK_RESPONSE_BYTES + 1
+        ).into_bytes();
+        wire.extend(vec![b'x'; MAX_WEBHOOK_RESPONSE_BYTES + 1]);
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (addr, server) = serve_one_local_response(wire);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap();
+            let mut response = client.get(format!("http://{addr}/")).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let result = read_response_limited(&mut response).await;
+            assert!(result.is_err());
+            assert!(result.err().unwrap().to_string().contains("64 KiB"));
+        });
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn live_loopback_receipts_respect_declared_and_actual_limits() {
+        let payload = br#"{"id":"synthetic-receipt"}"#;
+        let mut success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        ).into_bytes();
+        success.extend_from_slice(payload);
+        let (addr, server) = serve_one_local_response(success);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap();
+            let mut response = client.get(format!("http://{addr}/")).send().await.unwrap();
+            let body = read_response_limited(&mut response).await.unwrap();
+            assert_eq!(body, r#"{"id":"synthetic-receipt"}"#);
+        });
+        server.join().unwrap();
+
+        let oversized_header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_WEBHOOK_RESPONSE_BYTES + 1
+        ).into_bytes();
+        let (addr, server) = serve_one_local_response(oversized_header);
+        runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap();
+            let mut response = client.get(format!("http://{addr}/")).send().await.unwrap();
+            let result = read_response_limited(&mut response).await;
+            assert!(result.is_err());
+            assert!(result.err().unwrap().to_string().contains("Content-Length"));
+        });
+        server.join().unwrap();
     }
 
 }
