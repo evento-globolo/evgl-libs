@@ -7,7 +7,11 @@ use hmac::{Hmac, Mac};
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::{net::{IpAddr, SocketAddr}, time::Duration};
+use std::{future::Future, net::{IpAddr, SocketAddr}, time::Duration};
+
+const MAX_WEBHOOK_REQUEST_BYTES: usize = 512 * 1024;
+const MAX_WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
+const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -84,6 +88,12 @@ impl ProviderAdapter for GenericWebhookAdapter {
             "event": event,
             "options": context.target_options
         }))?;
+        // Bound outbound work before signing or attempting DNS/network I/O.
+        if payload.len() > MAX_WEBHOOK_REQUEST_BYTES {
+            return Err(ProviderError::Configuration(
+                "webhook request payload exceeds the configured size limit".into(),
+            ));
+        }
         let mut mac = HmacSha256::new_from_slice(tokens.access_token.expose_secret().as_bytes())
             .map_err(|_| ProviderError::Configuration("invalid webhook secret".into()))?;
         mac.update(&payload);
@@ -99,19 +109,19 @@ impl ProviderAdapter for GenericWebhookAdapter {
             .send()
             .await?;
         let status = response.status();
-        let body = response.text().await?;
         if !status.is_success() {
-            return Err(ProviderError::Remote {
-                status: status.as_u16(),
-                body,
-            });
+            // Do not propagate arbitrary remote HTML or secret-like text into
+            // user-facing errors or logs. The status code is sufficient here.
+            return Err(remote_status_error(status));
         }
+        let mut response = response;
+        let body = read_response_limited(&mut response).await?;
         let receipt = if body.trim().is_empty() {
             json!({ "status": status.as_u16() })
         } else {
             serde_json::from_str(&body).map_err(|error| {
                 ProviderError::InvalidResponse(format!(
-                    "successful webhook response was not JSON: {error}; body={body}",
+                    "successful webhook response was not JSON: {error}",
                 ))
             })?
         };
@@ -127,6 +137,53 @@ impl ProviderAdapter for GenericWebhookAdapter {
             action: None,
         })
     }
+}
+
+fn remote_status_error(status: reqwest::StatusCode) -> ProviderError {
+    return ProviderError::Remote {
+        status: status.as_u16(),
+        body: "remote response body withheld".into(),
+    };
+}
+
+fn append_bounded(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ProviderError> {
+    if chunk.len() > MAX_WEBHOOK_RESPONSE_BYTES.saturating_sub(buffer.len()) {
+        return Err(ProviderError::InvalidResponse(
+            "webhook response exceeded 64 KiB limit".into(),
+        ));
+    }
+    buffer.extend_from_slice(chunk);
+    return Ok(());
+}
+
+async fn read_response_limited(response: &mut reqwest::Response) -> Result<String, ProviderError> {
+    if response.content_length().is_some_and(|len| len > MAX_WEBHOOK_RESPONSE_BYTES as u64) {
+        return Err(ProviderError::InvalidResponse(
+            "webhook response Content-Length exceeds 64 KiB".into(),
+        ));
+    }
+    // Check *actual decoded bytes* per chunk; a lying Content-Length header
+    // must not bypass the cap or cause unbounded allocation.
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        append_bounded(&mut body, &chunk)?;
+    }
+    return String::from_utf8(body).map_err(|_| {
+        ProviderError::InvalidResponse("webhook response must be UTF-8".into())
+    });
+}
+
+async fn lookup_before_deadline<F, T>(
+    lookup: F,
+    duration: Duration,
+) -> Result<T, ProviderError>
+where
+    F: Future<Output = std::io::Result<T>>,
+{
+    return tokio::time::timeout(duration, lookup)
+        .await
+        .map_err(|_| ProviderError::Configuration("webhook DNS lookup timed out".into()))?
+        .map_err(|_| ProviderError::Configuration("webhook DNS lookup failed".into()));
 }
 
 fn validate_endpoint(endpoint: &Url) -> Result<(), ProviderError> {
@@ -235,11 +292,9 @@ async fn guarded_client_for_endpoint(endpoint: &Url) -> Result<reqwest::Client, 
         url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
     };
     let addrs: Vec<SocketAddr> = if let Some(name) = hostname.as_deref() {
-        tokio::net::lookup_host((name, port))
-            .await
-            .map_err(|error| ProviderError::Configuration(format!(
-                "webhook hostname DNS lookup failed: {error}"
-            )))?
+        lookup_before_deadline(tokio::net::lookup_host((name, port)), DNS_TIMEOUT)
+            .await?
+            .take(33)
             .collect()
     } else {
         match endpoint.host() {
