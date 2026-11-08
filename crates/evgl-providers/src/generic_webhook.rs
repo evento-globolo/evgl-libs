@@ -7,7 +7,10 @@ use hmac::{Hmac, Mac};
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::{net::{IpAddr, SocketAddr}, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -99,7 +102,7 @@ impl ProviderAdapter for GenericWebhookAdapter {
             .send()
             .await?;
         let status = response.status();
-        let body = response.text().await?;
+        let body = bounded_response_text(response).await?;
         if !status.is_success() {
             return Err(ProviderError::Remote {
                 status: status.as_u16(),
@@ -111,7 +114,7 @@ impl ProviderAdapter for GenericWebhookAdapter {
         } else {
             serde_json::from_str(&body).map_err(|error| {
                 ProviderError::InvalidResponse(format!(
-                    "successful webhook response was not JSON: {error}; body={body}",
+                    "successful webhook response was not JSON: {error}",
                 ))
             })?
         };
@@ -129,10 +132,50 @@ impl ProviderAdapter for GenericWebhookAdapter {
     }
 }
 
+const MAX_WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
+
+// Check each chunk *before* extending the buffer, so content-length-less or
+// chunked error responses cannot consume unbounded memory in a worker.
+fn append_bounded_response(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ProviderError> {
+    if chunk.len() > MAX_WEBHOOK_RESPONSE_BYTES.saturating_sub(buffer.len()) {
+        return Err(ProviderError::InvalidResponse(
+            "webhook response exceeds 64 KiB".into(),
+        ));
+    }
+    buffer.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn decode_webhook_text(buffer: Vec<u8>) -> Result<String, ProviderError> {
+    String::from_utf8(buffer)
+        .map_err(|_| ProviderError::InvalidResponse("webhook response must be UTF-8".into()))
+}
+
+async fn bounded_response_text(mut response: reqwest::Response) -> Result<String, ProviderError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_WEBHOOK_RESPONSE_BYTES as u64)
+    {
+        return Err(ProviderError::InvalidResponse(
+            "webhook response exceeds 64 KiB".into(),
+        ));
+    }
+    let mut buffer = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        append_bounded_response(&mut buffer, &chunk)?;
+    }
+    decode_webhook_text(buffer)
+}
+
 fn validate_endpoint(endpoint: &Url) -> Result<(), ProviderError> {
     if endpoint.scheme() != "https" {
         return Err(ProviderError::Configuration(
             "webhook endpoint must use HTTPS".into(),
+        ));
+    }
+    if endpoint.fragment().is_some() {
+        return Err(ProviderError::Configuration(
+            "webhook endpoint must not include a URL fragment".into(),
         ));
     }
     if !endpoint.username().is_empty() || endpoint.password().is_some() {
@@ -194,6 +237,7 @@ fn public_address(ip: IpAddr) -> bool {
                     || (o[0] == 100 && (64..=127).contains(&o[1]))
                     || (o[0] == 198 && (18..=19).contains(&o[1]))
                     || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                    || (o[0] == 192 && o[1] == 88 && o[2] == 99)
             )
         }
         IpAddr::V6(v6) => {
@@ -276,7 +320,10 @@ fn client_for_resolved(
 
 #[cfg(test)]
 mod tests {
-    use super::{client_for_resolved, public_address, validate_addresses, validate_endpoint};
+    use super::{
+        append_bounded_response, client_for_resolved, decode_webhook_text, public_address,
+        validate_addresses, validate_endpoint, MAX_WEBHOOK_RESPONSE_BYTES,
+    };
     use std::net::{IpAddr, SocketAddr};
     use url::Url;
 
@@ -290,6 +337,7 @@ mod tests {
             "https://service.internal./hook",
             "https://printer.local/hook",
             "https://admin:password@events.example.com/hook",
+            "https://events.example.com/hook#fragment",
             "https://127.0.0.1/hook",
             "https://127.1/hook",
             "https://10.0.0.1/hook",
@@ -349,6 +397,32 @@ mod tests {
     }
 
     #[test]
+    fn webhook_response_limits_accept_exact_boundary_and_deny_overflow() {
+        let mut data = Vec::new();
+        append_bounded_response(&mut data, &vec![b'x'; MAX_WEBHOOK_RESPONSE_BYTES])
+            .expect("64 KiB exactly is allowed");
+        assert_eq!(data.len(), MAX_WEBHOOK_RESPONSE_BYTES);
+        assert!(append_bounded_response(&mut data, b"x").is_err());
+        assert_eq!(data.len(), MAX_WEBHOOK_RESPONSE_BYTES);
+        assert_eq!(decode_webhook_text(data).unwrap().len(), MAX_WEBHOOK_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn webhook_response_limits_reject_chunks_without_partial_append() {
+        let mut data = b"ok".to_vec();
+        assert!(append_bounded_response(&mut data, &vec![0; MAX_WEBHOOK_RESPONSE_BYTES]).is_err());
+        assert_eq!(data, b"ok");
+        append_bounded_response(&mut data, b"!").unwrap();
+        assert_eq!(decode_webhook_text(data).unwrap(), "ok!");
+    }
+
+    #[test]
+    fn webhook_response_rejects_malformed_utf8() {
+        assert!(decode_webhook_text(vec![0xff, 0xfe]).is_err());
+        assert_eq!(decode_webhook_text(Vec::new()).unwrap(), "");
+    }
+
+    #[test]
     fn rejects_private_ipv4_embedded_in_ipv6() {
         for literal in [
             "::ffff:127.0.0.1",
@@ -374,6 +448,7 @@ mod tests {
             "198.18.0.1",
             "198.19.255.1",
             "192.0.0.8",
+            "192.88.99.1",
             "224.1.2.3",
             "240.0.0.1",
             "255.255.255.255",
