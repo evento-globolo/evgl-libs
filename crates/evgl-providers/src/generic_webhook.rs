@@ -7,7 +7,11 @@ use hmac::{Hmac, Mac};
 use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::{net::{IpAddr, SocketAddr}, time::Duration};
+use std::{future::Future, net::{IpAddr, SocketAddr}, time::Duration};
+
+const MAX_WEBHOOK_REQUEST_BYTES: usize = 512 * 1024;
+const MAX_WEBHOOK_RESPONSE_BYTES: usize = 64 * 1024;
+const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -84,6 +88,8 @@ impl ProviderAdapter for GenericWebhookAdapter {
             "event": event,
             "options": context.target_options
         }))?;
+        // Bound outbound work before signing or attempting DNS/network I/O.
+        validate_payload_size(payload.len())?;
         let mut mac = HmacSha256::new_from_slice(tokens.access_token.expose_secret().as_bytes())
             .map_err(|_| ProviderError::Configuration("invalid webhook secret".into()))?;
         mac.update(&payload);
@@ -99,19 +105,19 @@ impl ProviderAdapter for GenericWebhookAdapter {
             .send()
             .await?;
         let status = response.status();
-        let body = response.text().await?;
         if !status.is_success() {
-            return Err(ProviderError::Remote {
-                status: status.as_u16(),
-                body,
-            });
+            // Do not propagate arbitrary remote HTML or secret-like text into
+            // user-facing errors or logs. The status code is sufficient here.
+            return Err(remote_status_error(status));
         }
+        let mut response = response;
+        let body = read_response_limited(&mut response).await?;
         let receipt = if body.trim().is_empty() {
             json!({ "status": status.as_u16() })
         } else {
             serde_json::from_str(&body).map_err(|error| {
                 ProviderError::InvalidResponse(format!(
-                    "successful webhook response was not JSON: {error}; body={body}",
+                    "successful webhook response was not JSON: {error}",
                 ))
             })?
         };
@@ -127,6 +133,62 @@ impl ProviderAdapter for GenericWebhookAdapter {
             action: None,
         })
     }
+}
+
+fn validate_payload_size(size: usize) -> Result<(), ProviderError> {
+    if size > MAX_WEBHOOK_REQUEST_BYTES {
+        return Err(ProviderError::Configuration(
+            "webhook request payload exceeds the configured size limit".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn remote_status_error(status: reqwest::StatusCode) -> ProviderError {
+    ProviderError::Remote {
+        status: status.as_u16(),
+        body: "remote response body withheld".into(),
+    }
+}
+
+fn append_bounded(buffer: &mut Vec<u8>, chunk: &[u8]) -> Result<(), ProviderError> {
+    if chunk.len() > MAX_WEBHOOK_RESPONSE_BYTES.saturating_sub(buffer.len()) {
+        return Err(ProviderError::InvalidResponse(
+            "webhook response exceeded 64 KiB limit".into(),
+        ));
+    }
+    buffer.extend_from_slice(chunk);
+    Ok(())
+}
+
+async fn read_response_limited(response: &mut reqwest::Response) -> Result<String, ProviderError> {
+    if response.content_length().is_some_and(|len| len > MAX_WEBHOOK_RESPONSE_BYTES as u64) {
+        return Err(ProviderError::InvalidResponse(
+            "webhook response Content-Length exceeds 64 KiB".into(),
+        ));
+    }
+    // Check *actual decoded bytes* per chunk; a lying Content-Length header
+    // must not bypass the cap or cause unbounded allocation.
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        append_bounded(&mut body, &chunk)?;
+    }
+    String::from_utf8(body).map_err(|_| {
+        ProviderError::InvalidResponse("webhook response must be UTF-8".into())
+    })
+}
+
+async fn lookup_before_deadline<F, T>(
+    lookup: F,
+    duration: Duration,
+) -> Result<T, ProviderError>
+where
+    F: Future<Output = std::io::Result<T>>,
+{
+    tokio::time::timeout(duration, lookup)
+        .await
+        .map_err(|_| ProviderError::Configuration("webhook DNS lookup timed out".into()))?
+        .map_err(|_| ProviderError::Configuration("webhook DNS lookup failed".into()))
 }
 
 fn validate_endpoint(endpoint: &Url) -> Result<(), ProviderError> {
@@ -235,11 +297,9 @@ async fn guarded_client_for_endpoint(endpoint: &Url) -> Result<reqwest::Client, 
         url::Host::Ipv4(_) | url::Host::Ipv6(_) => None,
     };
     let addrs: Vec<SocketAddr> = if let Some(name) = hostname.as_deref() {
-        tokio::net::lookup_host((name, port))
-            .await
-            .map_err(|error| ProviderError::Configuration(format!(
-                "webhook hostname DNS lookup failed: {error}"
-            )))?
+        lookup_before_deadline(tokio::net::lookup_host((name, port)), DNS_TIMEOUT)
+            .await?
+            .take(33)
             .collect()
     } else {
         match endpoint.host() {
@@ -276,8 +336,13 @@ fn client_for_resolved(
 
 #[cfg(test)]
 mod tests {
-    use super::{client_for_resolved, public_address, validate_addresses, validate_endpoint};
-    use std::net::{IpAddr, SocketAddr};
+    use super::{
+        append_bounded, client_for_resolved, guarded_client_for_endpoint, lookup_before_deadline,
+        public_address, read_response_limited, remote_status_error, validate_addresses,
+        validate_endpoint, validate_payload_size, MAX_WEBHOOK_REQUEST_BYTES,
+        MAX_WEBHOOK_RESPONSE_BYTES,
+    };
+    use std::{future::pending, io::{Read, Write}, net::{IpAddr, SocketAddr, TcpListener}, thread, time::Duration};
     use url::Url;
 
     #[test]
@@ -383,4 +448,182 @@ mod tests {
         assert!(public_address("8.8.8.8".parse().unwrap()));
         assert!(public_address("1.1.1.1".parse().unwrap()));
     }
+    #[test]
+    fn bounds_response_chunks_without_allocating_beyond_limit() {
+        let mut body = Vec::new();
+        assert!(append_bounded(&mut body, &vec![b'a'; MAX_WEBHOOK_RESPONSE_BYTES - 1]).is_ok());
+        assert!(append_bounded(&mut body, b"b").is_ok());
+        assert_eq!(body.len(), MAX_WEBHOOK_RESPONSE_BYTES);
+        let result = append_bounded(&mut body, b"must-not-be-appended");
+        assert!(result.is_err());
+        assert_eq!(body.len(), MAX_WEBHOOK_RESPONSE_BYTES);
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("64 KiB"));
+        assert!(!err.contains("must-not-be-appended"));
+        assert!(append_bounded(&mut Vec::new(), &[1_u8; 0]).is_ok());
+        assert!(append_bounded(&mut Vec::new(), &vec![b'x'; MAX_WEBHOOK_RESPONSE_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn request_size_boundary_fails_closed() {
+        assert!(validate_payload_size(0).is_ok());
+        assert!(validate_payload_size(MAX_WEBHOOK_REQUEST_BYTES).is_ok());
+        assert!(validate_payload_size(MAX_WEBHOOK_REQUEST_BYTES + 1).is_err());
+        assert!(validate_payload_size(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn remote_failure_does_not_echo_untrusted_error_body() {
+        let err = remote_status_error(reqwest::StatusCode::BAD_GATEWAY);
+        let display = err.to_string();
+        assert!(display.contains("502"));
+        assert!(display.contains("withheld"));
+        assert!(!display.contains("secret"));
+    }
+
+    #[test]
+    fn dns_lookup_has_a_real_timeout_and_redacts_failures() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("Tokio runtime is available");
+        runtime.block_on(async {
+            let result = lookup_before_deadline(
+                pending::<std::io::Result<()>>(),
+                Duration::from_millis(1),
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(result.err().unwrap().to_string().contains("timed out"));
+
+            let ok = lookup_before_deadline(
+                async { Ok::<_, std::io::Error>(42_u8) },
+                Duration::from_secs(1),
+            ).await;
+            assert_eq!(ok.unwrap(), 42);
+
+            let io_error = lookup_before_deadline(
+                async { Err::<(), _>(std::io::Error::other("canary-secret")) },
+                Duration::from_secs(1),
+            ).await.err().unwrap().to_string();
+            assert!(io_error.contains("DNS lookup failed"));
+            assert!(!io_error.contains("canary-secret"));
+        });
+    }
+
+    #[test]
+    fn real_local_dns_is_rejected_without_attempting_https_connection() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Tokio runtime is available");
+        runtime.block_on(async {
+            // This exercises the operating system's actual localhost resolver,
+            // not merely a fabricated array of IP addresses.
+            let candidates = lookup_before_deadline(
+                tokio::net::lookup_host(("localhost", 443)),
+                Duration::from_secs(3),
+            ).await.expect("localhost is resolvable on CI");
+            let addrs: Vec<_> = candidates.collect();
+            assert!(!addrs.is_empty());
+            assert!(validate_addresses(&addrs).is_err());
+
+            // The production guarded path also fails for the IP literal.
+            let direct = guarded_client_for_endpoint(
+                &Url::parse("https://127.0.0.1/internal").unwrap(),
+            ).await;
+            assert!(direct.is_err());
+        });
+    }
+
+    // A real loopback HTTP socket exercises reqwest response framing and the
+    // production receipt reader, without granting the production egress guard
+    // permission to contact loopback.
+    fn serve_one_local_response(wire: Vec<u8>) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = [0_u8; 512];
+            let _ = socket.read(&mut request);
+            // A client that fails closed may drop the connection while sending.
+            // This is expected and must not make the test flaky.
+            let _ = socket.write_all(&wire);
+        });
+        (addr, server)
+    }
+
+    #[test]
+    fn live_loopback_chunked_body_overflow_is_rejected() {
+        let mut wire = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+            MAX_WEBHOOK_RESPONSE_BYTES + 1
+        ).into_bytes();
+        wire.extend(vec![b'x'; MAX_WEBHOOK_RESPONSE_BYTES + 1]);
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (addr, server) = serve_one_local_response(wire);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap();
+            let mut response = client.get(format!("http://{addr}/")).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let result = read_response_limited(&mut response).await;
+            assert!(result.is_err());
+            assert!(result.err().unwrap().to_string().contains("64 KiB"));
+        });
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn live_loopback_receipts_respect_declared_and_actual_limits() {
+        let payload = br#"{"id":"synthetic-receipt"}"#;
+        let mut success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        ).into_bytes();
+        success.extend_from_slice(payload);
+        let (addr, server) = serve_one_local_response(success);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap();
+            let mut response = client.get(format!("http://{addr}/")).send().await.unwrap();
+            let body = read_response_limited(&mut response).await.unwrap();
+            assert_eq!(body, r#"{"id":"synthetic-receipt"}"#);
+        });
+        server.join().unwrap();
+
+        let oversized_header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_WEBHOOK_RESPONSE_BYTES + 1
+        ).into_bytes();
+        let (addr, server) = serve_one_local_response(oversized_header);
+        runtime.block_on(async {
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap();
+            let mut response = client.get(format!("http://{addr}/")).send().await.unwrap();
+            let result = read_response_limited(&mut response).await;
+            assert!(result.is_err());
+            assert!(result.err().unwrap().to_string().contains("Content-Length"));
+        });
+        server.join().unwrap();
+    }
+
 }
